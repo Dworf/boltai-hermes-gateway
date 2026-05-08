@@ -172,6 +172,43 @@ def _openai_full_response(content: str, *, model: str = "claude-code") -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _make_envvar_rewrite_filter(adapter_name: str) -> logging.Filter:
+    """Logging filter that rewrites parent api_server messages to reference
+    this plugin's env vars.
+
+    The parent ``APIServerAdapter`` hardcodes ``API_SERVER_KEY`` in two
+    startup messages (the no-auth warning and the 0.0.0.0 refusal error).
+    Both are formatted with ``self.name`` as the first positional arg,
+    so we can target only records emitted about *our* adapter instance
+    and leave a real ``api_server`` adapter running alongside untouched.
+    """
+    replacements = (
+        ("API_SERVER_KEY / platforms.api_server.key",
+         "BOLTAI_HERMES_GW_KEY / platforms.boltai_hermes_gateway.key"),
+        ("API_SERVER_KEY", "BOLTAI_HERMES_GW_KEY"),
+    )
+
+    class _Rewriter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
+            try:
+                args = record.args
+                first = args[0] if isinstance(args, tuple) and args else None
+                if first != adapter_name:
+                    return True
+                msg = record.msg
+                if isinstance(msg, str) and "API_SERVER_KEY" in msg:
+                    for old, new in replacements:
+                        msg = msg.replace(old, new)
+                    record.msg = msg
+            except Exception:
+                pass
+            return True
+
+    f = _Rewriter()
+    f._boltai_gw_marker = adapter_name  # type: ignore[attr-defined]
+    return f
+
+
 class BoltAIGatewayAdapter(APIServerAdapter):
     """OpenAI-compatible HTTP server with slash-command interception.
 
@@ -266,6 +303,23 @@ class BoltAIGatewayAdapter(APIServerAdapter):
             )
             mode = DEFAULT_SLASH_STREAM_MODE
         self.slash_stream_mode: str = mode
+
+        # Install a logging filter on the parent api_server module's logger
+        # so the "No API key configured" / "Refusing to start" messages
+        # reference our env vars (BOLTAI_HERMES_GW_KEY) instead of the
+        # parent's hardcoded API_SERVER_KEY.  Scoped to records that name
+        # our adapter instance so we don't rewrite messages from a real
+        # api_server adapter running alongside us.
+        try:
+            parent_logger = logging.getLogger("gateway.platforms.api_server")
+            adapter_name = getattr(self, "name", PLATFORM_NAME)
+            if not any(
+                getattr(f, "_boltai_gw_marker", None) == adapter_name
+                for f in parent_logger.filters
+            ):
+                parent_logger.addFilter(_make_envvar_rewrite_filter(adapter_name))
+        except Exception:  # pragma: no cover — logging never breaks startup
+            pass
 
     def __repr__(self) -> str:
         return f"<BoltAIGatewayAdapter host={self._host!r} port={self._port}>"
