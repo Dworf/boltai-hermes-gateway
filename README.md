@@ -9,6 +9,9 @@ the official plugin system, runs on its own port alongside the built-in
 1. **Full markdown** in streamed responses (headers, bullets, bold, code fences, tables) — preserved verbatim instead of flattened to plain text.
 2. **Slash commands** (`/help`, `/status`, `/stop`, `/model …`, `/personality …`, etc.) typed directly into the chat box, dispatched server-side and returned as a normal chat completion.
 
+   
+<img width="1158" height="1593" alt="hermes_gateway_boltai_image" src="https://github.com/user-attachments/assets/c2733ed9-a75a-40b6-b8c8-558dcf51922d" />
+
 ---
 
 ## Why a separate plugin (and not patching the built-in `api_server`)
