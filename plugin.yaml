@@ -1,0 +1,42 @@
+name: boltai-hermes-gateway-platform
+label: BoltAI Hermes Gateway
+kind: platform
+version: 0.1.0
+description: >
+  OpenAI-compatible HTTP server with slash-command interception.
+  Subclasses the built-in api_server adapter, runs on its own port (default 8643),
+  and intercepts known gateway slash commands (e.g. /help, /status, /stop) before
+  they reach the agent loop. Designed for clients like BoltAI that send raw
+  OpenAI chat completions and lack client-side slash command UI.
+  Has its own BOLTAI_HERMES_GW_* env namespace so it never shares secrets or
+  settings with the built-in api_server.
+author: Nous Research
+optional_env:
+  - name: BOLTAI_HERMES_GW_ENABLED
+    description: "Auto-enable the plugin from env (1/true/yes). Otherwise enable via config.yaml."
+    prompt: "Enable BoltAI Hermes Gateway? (true/false)"
+    password: false
+  - name: BOLTAI_HERMES_GW_PORT
+    description: "TCP port to listen on (default: 8643)"
+    prompt: "Gateway port"
+    password: false
+  - name: BOLTAI_HERMES_GW_HOST
+    description: "Bind host (default: 127.0.0.1; set 0.0.0.0 for network access)"
+    prompt: "Bind host"
+    password: false
+  - name: BOLTAI_HERMES_GW_KEY
+    description: "Bearer token for authenticating /v1/* requests. Leave empty to disable auth on local-only deployments."
+    prompt: "API key"
+    password: true
+  - name: BOLTAI_HERMES_GW_CORS_ORIGINS
+    description: "Comma-separated allowed CORS origins, or '*' for any. Leave empty to disable CORS."
+    prompt: "CORS origins"
+    password: false
+  - name: BOLTAI_HERMES_GW_MODEL_NAME
+    description: "Model name to advertise on /v1/models (default: hermes-agent)"
+    prompt: "Advertised model name"
+    password: false
+  - name: BOLTAI_HERMES_GW_SLASH_STREAM_MODE
+    description: "Slash response streaming mode: token_stream (default) or single_chunk"
+    prompt: "Slash stream mode"
+    password: false

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boltai-hermes-gateway"
+version = "0.1.0"
+description = "OpenAI-compatible Hermes Agent gateway with full markdown + slash command support, designed for BoltAI and similar streaming chat clients."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Dworf" }]
+keywords = ["hermes-agent", "boltai", "openai-compatible", "gateway", "llm", "plugin"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Communications :: Chat",
+]
+# Runtime deps are provided by hermes-agent (aiohttp, etc.).
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Dworf/boltai-hermes-gateway"
+Documentation = "https://hermes-agent.nousresearch.com/docs"
+Issues = "https://github.com/Dworf/boltai-hermes-gateway/issues"
+"Hermes Agent" = "https://github.com/NousResearch/hermes-agent"
