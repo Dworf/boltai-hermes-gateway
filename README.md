@@ -209,6 +209,22 @@ boltai-hermes-gateway/
 6. **Streaming finalization.** Mid-stream client disconnects are caught in a try/finally so `write_eof()` always runs. `ConnectionResetError` at INFO level when a BoltAI tab closes mid-stream is expected.
 7. **Network exposure.** Setting `BOLTAI_HERMES_GW_HOST=0.0.0.0` exposes the gateway on your LAN. Use a strong `BOLTAI_HERMES_GW_KEY` and consider a firewall rule. There is no rate limiting in this plugin.
 
+## Changelog
+
+### 0.2.0
+
+- **Inline image rendering.** When the agent emits a local image path (from `image_generate`, vision tool, browser screenshots, etc.), the plugin reads the file, base64-encodes it, and rewrites the markdown to a `data:` URL before streaming. BoltAI renders the image inline — no hosted URL or upload channel required.
+- New `image_inliner.py` module: streaming-safe rewriter that buffers `![alt](path)` across SSE chunks and handles both the streaming and non-streaming response paths.
+- `adapter.py` overrides `_run_agent` to wire the rewriter into outbound text on both code paths.
+
+### 0.1.0
+
+- Initial release.
+- Subclasses Hermes' `APIServerAdapter` to add full markdown rendering in streamed responses (headers, bullets, bold, code fences, tables) instead of the flattened plain-text output the stock gateway produces.
+- Server-side slash-command dispatch (`/help`, `/status`, `/stop`, `/model …`, `/personality …`, etc.) typed directly in the BoltAI chat box.
+- Independent env namespace (`BOLTAI_HERMES_GW_*`) and port so it runs alongside the built-in `api_server` without conflicts.
+- 38 tests covering env isolation, auth, slash detection, both streaming modes, and disconnect cleanup.
+
 ## Contributing
 
 Issues and PRs welcome. If you build on top of this for another OpenAI-compatible client, please:
