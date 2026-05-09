@@ -105,7 +105,7 @@ All settings are optional. The plugin auto-enables itself when `BOLTAI_HERMES_GW
 | `BOLTAI_HERMES_GW_PORT` | `8643` | TCP port to listen on |
 | `BOLTAI_HERMES_GW_HOST` | `127.0.0.1` | Bind host (`0.0.0.0` for LAN access — secure with a strong key!) |
 | `BOLTAI_HERMES_GW_KEY` | empty | Bearer token for `Authorization: Bearer …`. Empty = open (local-only OK) |
-| `BOLTAI_HERMES_GW_CORS_ORIGINS` | empty | Comma-separated allowed origins, or `*`. Empty disables CORS |
+| `BOLTAI_HERMES_GW_CORS_ORIGINS` | empty | Comma-separated allowed origins, or `*`. Empty disables CORS. **Set to `*` if you want BoltAI's "Save As" / right-click-download on served files to work** — Electron issues those fetches from a `null` / `file://` origin, which only `*` matches |
 | `BOLTAI_HERMES_GW_MODEL_NAME` | `hermes-agent` | Model name advertised on `/v1/models` |
 | `BOLTAI_HERMES_GW_SLASH_STREAM_MODE` | `token_stream` | `token_stream` or `single_chunk` |
 | `BOLTAI_HERMES_GW_MEDIA_MODE` | `link` | `link` (token-keyed HTTP URLs), `inline` (base64), or `off` |
@@ -228,6 +228,7 @@ boltai-hermes-gateway/
 - **Token-as-auth security model.** 256-bit `secrets.token_urlsafe(32)` tokens, no bearer header required for `<img>` tags to work. Same model as S3 presigned URLs.
 - **Graceful fallback.** If `link` mode can't initialise the file server for any reason, the adapter automatically falls back to `inline`.
 - **Streaming rewriter fix.** When `!` and `[alt](url)` arrived in separate SSE chunks, the buffer-rewind logic emitted the bang as plain text before the rewrite ran, leaving a stray `!` in front of the rendered image. Image-start now wins over link-start when they overlap.
+- **CORS note for "Save As".** BoltAI's right-click → Save As fetches the file from a `null` / `file://` origin (Electron quirk), so `BOLTAI_HERMES_GW_CORS_ORIGINS=*` is required if you want downloads to work. Inline display works without it.
 - **CORS scoped to success + preflight.** `Access-Control-Allow-Origin: *` and friends are sent on `200` responses and `OPTIONS` preflights only — not on `404`/`410`. Lets Electron/Chromium's "save image as" / copy-image XHR paths work without leaking CORS metadata on misses.
 - **Quieter logs.** Per-request file-server hits and per-rewrite media-rewriter lines demoted to `debug`. Production logs no longer get a line per image.
 
