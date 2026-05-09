@@ -9,6 +9,12 @@ resolve to a known gateway command are dispatched via the gateway message
 handler instead of the agent loop.  Auth is enforced FIRST — slash dispatch
 does not bypass authentication.
 
+v0.3.0 adds local-file media handling.  See ``media_rewriter`` and
+``file_server`` modules.  Three modes via
+``BOLTAI_HERMES_GW_MEDIA_MODE``: ``link`` (default — token-keyed HTTP
+URLs served from the gateway itself), ``inline`` (base64 data URLs,
+v0.2.0 behaviour), ``off`` (no rewriting).
+
 Configuration is namespaced via ``BOLTAI_HERMES_GW_*`` env vars so this
 plugin can run side-by-side with the built-in ``api_server`` adapter
 without sharing port, API key, CORS settings, or model name.
@@ -21,10 +27,15 @@ Recognized env vars (all optional):
 - ``BOLTAI_HERMES_GW_CORS_ORIGINS``   — comma-separated origins or "*"
 - ``BOLTAI_HERMES_GW_MODEL_NAME``     — model name to advertise on /v1/models
 - ``BOLTAI_HERMES_GW_SLASH_STREAM_MODE`` — single_chunk (default) | token_stream
+- ``BOLTAI_HERMES_GW_MEDIA_MODE``     — link (default) | inline | off
+- ``BOLTAI_HERMES_GW_FILE_TTL``       — file-token TTL in seconds (default: 86400)
+- ``BOLTAI_HERMES_GW_FILE_URL_BASE``  — pin URL base (e.g. ``https://hermes.mydomain.com``);
+                                        otherwise built from request Host header
 """
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -39,7 +50,22 @@ from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.base import MessageEvent, MessageType
 from hermes_cli.commands import GATEWAY_KNOWN_COMMANDS, resolve_command
 
-from .image_inliner import StreamingImageRewriter, rewrite_local_images
+from .file_server import DEFAULT_TTL_SECONDS, FileServer
+from .media_rewriter import (
+    MODE_INLINE,
+    MODE_LINK,
+    MODE_OFF,
+    VALID_MODES,
+    StreamingMediaRewriter,
+    rewrite as rewrite_media,
+)
+
+# Per-request context var so the streaming rewriter (created inside
+# ``_run_agent``, with no direct access to the aiohttp request) can
+# build URLs based on the inbound request's Host / X-Forwarded-* headers.
+_REQUEST_CTX: contextvars.ContextVar[Optional["web.Request"]] = contextvars.ContextVar(
+    "boltai_hermes_gw_request", default=None
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +78,9 @@ PLATFORM_NAME = "boltai_hermes_gateway"
 ENV_PREFIX = "BOLTAI_HERMES_GW_"
 
 _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
+
+# Media-handling defaults
+DEFAULT_MEDIA_MODE = MODE_LINK
 
 # Slash response streaming modes
 SLASH_STREAM_SINGLE_CHUNK = "single_chunk"
@@ -291,6 +320,26 @@ class BoltAIGatewayAdapter(APIServerAdapter):
             if env_mode:
                 extra["slash_stream_mode"] = env_mode
 
+        # Media handling — same pattern.
+        if "media_mode" not in extra or not extra.get("media_mode"):
+            env_media = _env("MEDIA_MODE")
+            if env_media:
+                extra["media_mode"] = env_media
+        if "file_ttl" not in extra or not extra.get("file_ttl"):
+            ttl_raw = _env("FILE_TTL")
+            if ttl_raw:
+                try:
+                    extra["file_ttl"] = int(ttl_raw)
+                except ValueError:
+                    logger.warning(
+                        "Invalid %sFILE_TTL=%r — using default %d",
+                        ENV_PREFIX, ttl_raw, DEFAULT_TTL_SECONDS,
+                    )
+        if "file_url_base" not in extra or not extra.get("file_url_base"):
+            url_base = _env("FILE_URL_BASE")
+            if url_base:
+                extra["file_url_base"] = url_base
+
         super().__init__(config)
         # Override the platform value so we don't collide with the built-in
         # api_server in the platform registry.  Platform enum supports
@@ -305,6 +354,25 @@ class BoltAIGatewayAdapter(APIServerAdapter):
             )
             mode = DEFAULT_SLASH_STREAM_MODE
         self.slash_stream_mode: str = mode
+
+        # Media mode + file server.  ``link`` (default) registers files
+        # with an in-process token store and serves them via
+        # ``/v1/files/{token}``.  ``inline`` falls back to base64 data
+        # URLs.  ``off`` skips rewriting entirely.
+        media_mode = extra.get("media_mode") or DEFAULT_MEDIA_MODE
+        if media_mode not in VALID_MODES:
+            logger.warning(
+                "Invalid media_mode=%r, falling back to %s",
+                media_mode, DEFAULT_MEDIA_MODE,
+            )
+            media_mode = DEFAULT_MEDIA_MODE
+        self.media_mode: str = media_mode
+        self._file_ttl: int = int(extra.get("file_ttl") or DEFAULT_TTL_SECONDS)
+        self._file_url_base: str = extra.get("file_url_base") or ""
+        # FileServer instance is created lazily on connect() so unit
+        # tests that construct the adapter without starting the server
+        # don't leak any state.
+        self._file_server: Optional[FileServer] = None
 
         # Install a logging filter on the parent api_server module's logger
         # so the "No API key configured" / "Refusing to start" messages
@@ -327,6 +395,100 @@ class BoltAIGatewayAdapter(APIServerAdapter):
         return f"<BoltAIGatewayAdapter host={self._host!r} port={self._port}>"
 
     # ------------------------------------------------------------------
+    # File-serving route
+    # ------------------------------------------------------------------
+
+    async def connect(self) -> bool:
+        """Start the API server, with our ``/v1/files/{token}`` route added.
+
+        Implementation note: the parent's ``connect()`` builds the
+        aiohttp app and freezes it (via ``AppRunner.setup``) without
+        yielding control, so we can't add routes between construction
+        and freeze from the outside.  Instead, we scope-patch the
+        ``web.Application`` reference held by the parent module for the
+        duration of ``super().connect()`` so the app it constructs
+        auto-registers our route at ``__init__`` time.
+
+        The patch is local to the api_server module (not global
+        aiohttp), so other plugins importing aiohttp directly are
+        unaffected.  The patch is reverted in a ``finally`` block.
+        """
+        if self.media_mode != MODE_OFF:
+            try:
+                self._file_server = FileServer(
+                    ttl_seconds=self._file_ttl,
+                    url_base_override=self._file_url_base or None,
+                )
+            except Exception:  # pragma: no cover — defensive
+                logger.exception("Failed to construct FileServer")
+                self._file_server = None
+
+        if self._file_server is None:
+            # Nothing to inject — fall through to the parent's connect.
+            return await super().connect()
+
+        # Scope-patch ``web.Application`` only for this connect call.
+        from gateway.platforms import api_server as _api_server_mod
+        original_app_cls = _api_server_mod.web.Application
+        file_handler = self._handle_file_serve
+        options_handler = self._handle_file_options
+        adapter_name = self.name
+        media_mode = self.media_mode
+        file_ttl = self._file_ttl
+
+        class _PatchedApplication(original_app_cls):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                try:
+                    self.router.add_get(
+                        "/v1/files/{token}", file_handler
+                    )
+                    self.router.add_options(
+                        "/v1/files/{token}", options_handler
+                    )
+                    logger.info(
+                        "[%s] File serving enabled at /v1/files/{token} "
+                        "(mode=%s, ttl=%ds)",
+                        adapter_name, media_mode, file_ttl,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[%s] Failed to register /v1/files route",
+                        adapter_name,
+                    )
+
+        _api_server_mod.web.Application = _PatchedApplication
+        try:
+            ok = await super().connect()
+        finally:
+            _api_server_mod.web.Application = original_app_cls
+
+        if not ok:
+            # Server didn't start — clear the file server so we don't
+            # accumulate stale token state on retry.
+            self._file_server = None
+        return ok
+
+    async def _handle_file_serve(self, request: "web.Request") -> "web.StreamResponse":
+        """Token-keyed file-serving handler.
+
+        Auth: token IS the auth — same model as S3 presigned URLs.  The
+        gateway's bearer-key middleware deliberately does not gate this
+        route, because BoltAI loads images via plain ``<img src>`` and
+        won't supply an Authorization header.  256 bits of randomness +
+        configurable TTL is the security boundary.
+        """
+        if self._file_server is None:
+            return web.Response(status=404, text="not found")
+        return await self._file_server.handle(request)
+
+    async def _handle_file_options(self, request):
+        """OPTIONS preflight for /v1/files/{token} — CORS handshake."""
+        if self._file_server is None:
+            return web.Response(status=204)
+        return await self._file_server.handle_options(request)
+
+    # ------------------------------------------------------------------
     # Slash interception override
     # ------------------------------------------------------------------
 
@@ -339,59 +501,75 @@ class BoltAIGatewayAdapter(APIServerAdapter):
              the body and call ``super()._handle_chat_completions``.
           3. If it's a known slash command, dispatch via ``_message_handler``
              and return the result (streaming or non-streaming).
+
+        Also: stash the inbound request in a ContextVar so the streaming
+        media rewriter (created deep inside ``_run_agent``) can read its
+        Host / X-Forwarded-* headers when building file URLs.
         """
-        # 1. Auth — never bypassed.
-        auth_err = self._check_auth(request)
-        if auth_err is not None:
-            return auth_err
-
-        # 2. Peek at the body.
-        raw_body = b""
+        # Make the inbound request visible to ``_run_agent`` and the
+        # streaming rewriter via contextvars.  Reset on the way out so
+        # we don't leak request state across handlers.
+        ctx_token = _REQUEST_CTX.set(request)
         try:
-            raw_body = await request.read()
-        except Exception:
-            # Couldn't read the body — let the parent's error path handle it
-            # with a fresh, empty replay.
-            return await super()._handle_chat_completions(
-                self._replay_request(request, b"")
-            )
-        try:
-            body = json.loads(raw_body) if raw_body else {}
-        except (json.JSONDecodeError, ValueError):
-            return await super()._handle_chat_completions(
-                self._replay_request(request, raw_body)
-            )
+            # 1. Auth — never bypassed.
+            auth_err = self._check_auth(request)
+            if auth_err is not None:
+                return auth_err
 
-        last_user_text = self._extract_last_user_text(body)
-        if not is_known_slash_command(last_user_text):
-            return await super()._handle_chat_completions(
-                self._replay_request(request, raw_body)
-            )
+            # 2. Peek at the body.
+            raw_body = b""
+            try:
+                raw_body = await request.read()
+            except Exception:
+                # Couldn't read the body — let the parent's error path
+                # handle it with a fresh, empty replay.
+                return await super()._handle_chat_completions(
+                    self._replay_request(request, b"")
+                )
+            try:
+                body = json.loads(raw_body) if raw_body else {}
+            except (json.JSONDecodeError, ValueError):
+                return await super()._handle_chat_completions(
+                    self._replay_request(request, raw_body)
+                )
 
-        # 3. Slash dispatch.
-        cmd_text = last_user_text.strip()
-        try:
-            # Some slash commands have artificial output caps in the gateway
-            # runner that exist for chat clients (Discord 2KB, Telegram 4KB).
-            # On HTTP we don't need them — render the unfiltered version
-            # locally before falling back to the generic dispatcher.
-            response_text = self._render_unlimited_slash(cmd_text)
+            last_user_text = self._extract_last_user_text(body)
+            if not is_known_slash_command(last_user_text):
+                return await super()._handle_chat_completions(
+                    self._replay_request(request, raw_body)
+                )
+
+            # 3. Slash dispatch.
+            cmd_text = last_user_text.strip()
+            try:
+                # Some slash commands have artificial output caps in the
+                # gateway runner that exist for chat clients (Discord
+                # 2KB, Telegram 4KB).  On HTTP we don't need them —
+                # render the unfiltered version locally before falling
+                # back to the generic dispatcher.
+                response_text = self._render_unlimited_slash(cmd_text)
+                if response_text is None:
+                    response_text = await self._dispatch_slash(cmd_text, request)
+            except Exception as exc:
+                logger.exception("Slash dispatch crashed for %r: %s", cmd_text, exc)
+                response_text = f"Error: {exc}"
             if response_text is None:
-                response_text = await self._dispatch_slash(cmd_text, request)
-        except Exception as exc:
-            logger.exception("Slash dispatch crashed for %r: %s", cmd_text, exc)
-            response_text = f"Error: {exc}"
-        if response_text is None:
-            response_text = ""  # silent commands — return empty content
+                response_text = ""  # silent commands — return empty content
 
-        stream_requested = bool(body.get("stream"))
-        header_mode = request.headers.get("X-Hermes-Slash-Stream")
-        mode = resolve_stream_mode(self.slash_stream_mode, header_mode)
-        model = body.get("model") or self._model_name or "claude-code"
+            stream_requested = bool(body.get("stream"))
+            header_mode = request.headers.get("X-Hermes-Slash-Stream")
+            mode = resolve_stream_mode(self.slash_stream_mode, header_mode)
+            model = body.get("model") or self._model_name or "claude-code"
 
-        if not stream_requested:
-            return web.json_response(_openai_full_response(response_text, model=model))
-        return await self._stream_slash_response(request, response_text, mode, model)
+            if not stream_requested:
+                return web.json_response(
+                    _openai_full_response(response_text, model=model)
+                )
+            return await self._stream_slash_response(
+                request, response_text, mode, model
+            )
+        finally:
+            _REQUEST_CTX.reset(ctx_token)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -669,8 +847,39 @@ class BoltAIGatewayAdapter(APIServerAdapter):
 
 
     # ------------------------------------------------------------------
-    # Image inlining override
+    # Media rewriting override
     # ------------------------------------------------------------------
+
+    def _build_url_for_request(self, request: Optional["web.Request"]):
+        """Return a ``url_builder(token) -> url`` closure for the rewriter.
+
+        The closure captures the inbound request so the rewriter can
+        read its Host / X-Forwarded-* headers when constructing URLs.
+        Returns ``None`` if the file server isn't available.
+        """
+        if self._file_server is None:
+            return None
+        if request is None:
+            # No request context available (e.g. agent triggered from
+            # a non-HTTP code path).  Use the configured override or a
+            # localhost guess so registration still succeeds.
+            base = self._file_url_base or f"http://{self._host}:{self._port}"
+            base = base.rstrip("/")
+            return lambda tok: f"{base}/v1/files/{tok}"
+        fs = self._file_server
+        return lambda tok: fs.url_for(tok, request)
+
+    def _resolve_media_mode(self) -> str:
+        """Pick the effective rewrite mode.
+
+        Falls back to ``inline`` if ``link`` is configured but the file
+        server didn't initialise (e.g. registration failed during
+        ``connect``).  Falls back to ``off`` if even inline can't run
+        for some reason.
+        """
+        if self.media_mode == MODE_LINK and self._file_server is None:
+            return MODE_INLINE
+        return self.media_mode
 
     async def _run_agent(
         self,
@@ -685,27 +894,30 @@ class BoltAIGatewayAdapter(APIServerAdapter):
         agent_ref=None,
         gateway_session_key=None,
     ):
-        """Override: rewrite local image paths to base64 data URLs.
+        """Override: rewrite local file refs in agent output.
 
-        BoltAI / OpenAI-compatible clients can't read the gateway's
-        filesystem, so ``![cat](/Users/.../foo.png)`` won't render.  We
-        replace local-path markdown images with ``data:image/...;base64,``
-        URLs so the markdown renderer displays them inline.
+        Mode-aware (see :mod:`media_rewriter`):
+          * ``link`` (default) — register each local file with the in-process
+            :class:`FileServer` and rewrite to ``http://.../v1/files/<token>``.
+            Smaller payloads, supports any file type, BoltAI caches the URL.
+          * ``inline`` — base64 encode images as data URLs (v0.2.0).
+          * ``off`` — pass-through, no rewriting.
 
-        * Streaming: wrap ``stream_delta_callback`` with a buffered
-          rewriter that holds back text only when an unclosed ``![`` is
-          in flight.  The original callback (which feeds the SSE queue)
-          sees rewritten text.
-        * Non-streaming: rewrite ``result['final_response']`` after the
-          agent returns, before passing it back up to the parent's
-          response-builder.
-        * The buffer is flushed on agent completion so the trailing
-          partial — if any — still reaches the client.
+        Streaming and non-streaming paths are both handled.
         """
+        effective_mode = self._resolve_media_mode()
+        request = _REQUEST_CTX.get()
+        url_builder = self._build_url_for_request(request)
+
         rewriter = None
         cb = stream_delta_callback
-        if cb is not None:
-            rewriter = StreamingImageRewriter(emit=cb)
+        if cb is not None and effective_mode != MODE_OFF:
+            rewriter = StreamingMediaRewriter(
+                emit=cb,
+                mode=effective_mode,
+                file_server=self._file_server,
+                url_builder=url_builder,
+            )
             cb = rewriter.feed
 
         try:
@@ -726,19 +938,23 @@ class BoltAIGatewayAdapter(APIServerAdapter):
                 try:
                     rewriter.flush()
                 except Exception:
-                    logger.exception("Image rewriter flush failed")
+                    logger.exception("Media rewriter flush failed")
 
-        # Non-streaming path uses result['final_response'] directly.  The
-        # streaming path also reads it as a fallback when no deltas were
-        # emitted (see api_server.py L1789-1797), so rewriting it here
-        # covers both.
-        if isinstance(result, dict):
+        # Non-streaming path uses result['final_response'] directly.
+        # The streaming path also reads it as a fallback when no deltas
+        # were emitted, so rewriting here covers both.
+        if isinstance(result, dict) and effective_mode != MODE_OFF:
             fr = result.get("final_response")
             if isinstance(fr, str) and fr:
                 try:
-                    result["final_response"] = rewrite_local_images(fr)
+                    result["final_response"] = rewrite_media(
+                        fr,
+                        mode=effective_mode,
+                        file_server=self._file_server,
+                        url_builder=url_builder,
+                    )
                 except Exception:
-                    logger.exception("final_response image rewrite failed")
+                    logger.exception("final_response media rewrite failed")
         return result, usage
 
 
@@ -755,7 +971,7 @@ def _env_enablement() -> dict[str, Any]:
     """Auto-seed PlatformConfig.extra (and ``enabled``) from env vars.
 
     Recognized: ENABLED, PORT, HOST, KEY, CORS_ORIGINS, MODEL_NAME,
-    SLASH_STREAM_MODE.
+    SLASH_STREAM_MODE, MEDIA_MODE, FILE_TTL, FILE_URL_BASE.
     """
     seed: dict[str, Any] = {}
     # ENABLED is read by gateway plugin loader; we surface it via the
@@ -777,6 +993,15 @@ def _env_enablement() -> dict[str, Any]:
         seed["model_name"] = model
     if (mode := _env("SLASH_STREAM_MODE")) is not None:
         seed["slash_stream_mode"] = mode
+    if (mm := _env("MEDIA_MODE")) is not None:
+        seed["media_mode"] = mm
+    if (ttl := _env("FILE_TTL")) is not None:
+        try:
+            seed["file_ttl"] = int(ttl)
+        except ValueError:
+            pass
+    if (base := _env("FILE_URL_BASE")) is not None:
+        seed["file_url_base"] = base
     return seed
 
 

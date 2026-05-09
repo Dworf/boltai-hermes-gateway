@@ -1,7 +1,7 @@
 name: boltai-hermes-gateway-platform
 label: BoltAI Hermes Gateway
 kind: platform
-version: 0.2.0
+version: 0.3.0
 description: >
   OpenAI-compatible HTTP server with slash-command interception.
   Subclasses the built-in api_server adapter, runs on its own port (default 8643),
@@ -39,4 +39,16 @@ optional_env:
   - name: BOLTAI_HERMES_GW_SLASH_STREAM_MODE
     description: "Slash response streaming mode: token_stream (default) or single_chunk"
     prompt: "Slash stream mode"
+    password: false
+  - name: BOLTAI_HERMES_GW_MEDIA_MODE
+    description: "Local-file rewriting mode: link (default, token-keyed HTTP URLs), inline (base64 data URLs), or off"
+    prompt: "Media mode"
+    password: false
+  - name: BOLTAI_HERMES_GW_FILE_TTL
+    description: "File-token TTL in seconds for link mode (default: 86400 = 24h)"
+    prompt: "File TTL (seconds)"
+    password: false
+  - name: BOLTAI_HERMES_GW_FILE_URL_BASE
+    description: "Override base URL for file links (e.g. https://hermes.mydomain.com). Otherwise built from request Host header."
+    prompt: "File URL base"
     password: false

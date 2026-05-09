@@ -8,7 +8,7 @@ the official plugin system, runs on its own port alongside the built-in
 
 1. **Full markdown** in streamed responses (headers, bullets, bold, code fences, tables) — preserved verbatim instead of flattened to plain text.
 2. **Slash commands** (`/help`, `/status`, `/stop`, `/model …`, `/personality …`, etc.) typed directly into the chat box, dispatched server-side and returned as a normal chat completion.
-3. **Inline images.** When the agent emits a local image path (from `image_generate`, vision tool screenshots, browser captures, etc.), the plugin reads the file, base64-encodes it, and rewrites the markdown to a `data:` URL before streaming. BoltAI renders the image inline with no extra hosting step or upload channel.
+3. **Local file serving for images and downloads.** When the agent emits a local file path (from `image_generate`, vision tool screenshots, browser captures, generated PDFs, etc.), the plugin registers it under a short-lived random token and rewrites the markdown to a `http://<gateway>/v1/files/<token>` URL. BoltAI renders images inline and shows other file types as clickable links. Smaller payloads than base64, supports any file type, and survives chat history without burning tokens. Falls back to base64 data URLs (`inline` mode) or pass-through (`off`) via `BOLTAI_HERMES_GW_MEDIA_MODE`.
 
    
 <img width="1158" height="1593" alt="hermes_gateway_boltai_image" src="https://github.com/user-attachments/assets/c2733ed9-a75a-40b6-b8c8-558dcf51922d" />
@@ -86,7 +86,12 @@ That's the only difference from the BoltAI doc: **port 8643 instead of 8642**.
   - `single_chunk` — emit one SSE delta with the full text + `[DONE]`. Lowest latency; good for programmatic clients.
   - Selected via env, `config.yaml`, or per-request `X-Hermes-Slash-Stream` header (header > config > env > default).
 - **Unlimited slash output.** Other gateways truncate `/help` to ~10 entries (with "and 82 more…") and paginate `/commands` 15-20 at a time — sensible for Discord/Telegram limits, painful on a full chat client. This plugin renders the **full unfiltered list** for `/help` and bare `/commands`. `MAX_MESSAGE_LENGTH` is bumped to 10 MB so the chunker never splits a long response on the wire.
-- **Image inlining.** OpenAI-compatible chat completions have no server→client file-upload channel — clients can only receive text. To work around this, the plugin scans agent output for local image paths (`MEDIA:<path>`, `![alt](/abs/path.png)`, etc.), reads the file, base64-encodes it, and rewrites the reference to a `data:image/<type>;base64,…` URL before streaming. BoltAI's markdown renderer displays the image inline. Works for `image_generate`, vision/browser screenshots, and any other tool that returns a local file path. Both streaming and non-streaming responses are rewritten. Files larger than 8 MB are skipped (configurable in `image_inliner.py`) to avoid blowing up response sizes. Note that BoltAI strips data URLs from the conversation history it replays on subsequent turns, so this does not eat input tokens on follow-ups.
+- **Local file serving.** OpenAI-compatible chat completions have no server→client file-upload channel — clients can only receive text and the URLs/data they choose to render from text. The plugin scans agent output for local file refs (`MEDIA:<path>`, `![alt](/abs/path.png)`, `[label](/abs/path.pdf)`, etc.) and rewrites them according to `BOLTAI_HERMES_GW_MEDIA_MODE`:
+  - **`link`** *(default)* — registers the file under a 256-bit random token and rewrites to `http://<gateway>/v1/files/<token>`. The gateway adds a new `GET /v1/files/{token}` route on the same port that streams the file with proper `Content-Type`. Tokens expire after `BOLTAI_HERMES_GW_FILE_TTL` seconds (default 24h). The token IS the auth — like an S3 presigned URL — so `<img src>` tags work without bearer headers. The URL base is built from the inbound request's `Host` header (with `X-Forwarded-Proto`/`Host` honoured for reverse proxies), so it works whether you bind `127.0.0.1`, `0.0.0.0`, or LAN IP. Supports any file type: images render inline, PDFs/audio/video become clickable links.
+  - **`inline`** — base64-encodes images as `data:image/...;base64,…` URLs (the v0.2.0 behaviour). Universal renderer support but bloats responses ~33%; capped at 8 MiB per image.
+  - **`off`** — pass-through, no rewriting. For debugging or clients that handle local paths themselves.
+
+  Both streaming and non-streaming responses are rewritten. Note that BoltAI strips data URLs and short-lived URLs from the conversation history it replays on subsequent turns, so neither mode eats input tokens on follow-ups.
 
 ## Configuration reference
 
@@ -103,6 +108,9 @@ All settings are optional. The plugin auto-enables itself when `BOLTAI_HERMES_GW
 | `BOLTAI_HERMES_GW_CORS_ORIGINS` | empty | Comma-separated allowed origins, or `*`. Empty disables CORS |
 | `BOLTAI_HERMES_GW_MODEL_NAME` | `hermes-agent` | Model name advertised on `/v1/models` |
 | `BOLTAI_HERMES_GW_SLASH_STREAM_MODE` | `token_stream` | `token_stream` or `single_chunk` |
+| `BOLTAI_HERMES_GW_MEDIA_MODE` | `link` | `link` (token-keyed HTTP URLs), `inline` (base64), or `off` |
+| `BOLTAI_HERMES_GW_FILE_TTL` | `86400` | File-token lifetime in seconds (link mode only). Default 24h |
+| `BOLTAI_HERMES_GW_FILE_URL_BASE` | unset | Pin the URL base for file links (e.g. `https://hermes.mydomain.com`). Otherwise built from request `Host` header |
 
 Example `~/.hermes/.env`:
 ```
@@ -191,7 +199,8 @@ boltai-hermes-gateway/
 ├── plugin.yaml          # Plugin manifest with optional_env declarations
 ├── __init__.py          # Re-exports register from adapter
 ├── adapter.py           # BoltAIGatewayAdapter — subclasses APIServerAdapter
-├── image_inliner.py     # Local-image-path → data-URL rewriter (streaming + final)
+├── media_rewriter.py    # Mode-aware local file → URL rewriter (streaming + final)
+├── file_server.py       # Token store + GET /v1/files/{token} handler
 ├── README.md            # This file
 ├── LICENSE              # Apache-2.0 (matches Hermes upstream)
 ├── pyproject.toml       # Optional packaging metadata
@@ -210,6 +219,17 @@ boltai-hermes-gateway/
 7. **Network exposure.** Setting `BOLTAI_HERMES_GW_HOST=0.0.0.0` exposes the gateway on your LAN. Use a strong `BOLTAI_HERMES_GW_KEY` and consider a firewall rule. There is no rate limiting in this plugin.
 
 ## Changelog
+
+### 0.3.0
+
+- **Local file serving via short-lived URLs (default).** Added a new `GET /v1/files/{token}` route on the gateway that streams files registered by an in-process token store. Agent output containing local paths is rewritten to `http://<gateway>/v1/files/<token>`. Smaller payloads than v0.2.0's base64 inlining, supports any file type (PDFs, audio, video as well as images), and tokens auto-expire after 24h (configurable).
+- **Three modes** via `BOLTAI_HERMES_GW_MEDIA_MODE`: `link` (new default), `inline` (v0.2.0 base64 behaviour, kept as fallback), `off` (pass-through). Renamed `image_inliner.py` to `media_rewriter.py` to reflect the broader scope.
+- **Reverse-proxy aware URL building.** Honours `X-Forwarded-Proto` / `X-Forwarded-Host` headers; otherwise uses the inbound request's `Host` header so URLs always match how the client reached the gateway. Override with `BOLTAI_HERMES_GW_FILE_URL_BASE` for pinned-URL deployments.
+- **Token-as-auth security model.** 256-bit `secrets.token_urlsafe(32)` tokens, no bearer header required for `<img>` tags to work. Same model as S3 presigned URLs.
+- **Graceful fallback.** If `link` mode can't initialise the file server for any reason, the adapter automatically falls back to `inline`.
+- **Streaming rewriter fix.** When `!` and `[alt](url)` arrived in separate SSE chunks, the buffer-rewind logic emitted the bang as plain text before the rewrite ran, leaving a stray `!` in front of the rendered image. Image-start now wins over link-start when they overlap.
+- **CORS scoped to success + preflight.** `Access-Control-Allow-Origin: *` and friends are sent on `200` responses and `OPTIONS` preflights only — not on `404`/`410`. Lets Electron/Chromium's "save image as" / copy-image XHR paths work without leaking CORS metadata on misses.
+- **Quieter logs.** Per-request file-server hits and per-rewrite media-rewriter lines demoted to `debug`. Production logs no longer get a line per image.
 
 ### 0.2.0
 
