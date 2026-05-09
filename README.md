@@ -8,6 +8,7 @@ the official plugin system, runs on its own port alongside the built-in
 
 1. **Full markdown** in streamed responses (headers, bullets, bold, code fences, tables) — preserved verbatim instead of flattened to plain text.
 2. **Slash commands** (`/help`, `/status`, `/stop`, `/model …`, `/personality …`, etc.) typed directly into the chat box, dispatched server-side and returned as a normal chat completion.
+3. **Inline images.** When the agent emits a local image path (from `image_generate`, vision tool screenshots, browser captures, etc.), the plugin reads the file, base64-encodes it, and rewrites the markdown to a `data:` URL before streaming. BoltAI renders the image inline with no extra hosting step or upload channel.
 
    
 <img width="1158" height="1593" alt="hermes_gateway_boltai_image" src="https://github.com/user-attachments/assets/c2733ed9-a75a-40b6-b8c8-558dcf51922d" />
@@ -85,6 +86,7 @@ That's the only difference from the BoltAI doc: **port 8643 instead of 8642**.
   - `single_chunk` — emit one SSE delta with the full text + `[DONE]`. Lowest latency; good for programmatic clients.
   - Selected via env, `config.yaml`, or per-request `X-Hermes-Slash-Stream` header (header > config > env > default).
 - **Unlimited slash output.** Other gateways truncate `/help` to ~10 entries (with "and 82 more…") and paginate `/commands` 15-20 at a time — sensible for Discord/Telegram limits, painful on a full chat client. This plugin renders the **full unfiltered list** for `/help` and bare `/commands`. `MAX_MESSAGE_LENGTH` is bumped to 10 MB so the chunker never splits a long response on the wire.
+- **Image inlining.** OpenAI-compatible chat completions have no server→client file-upload channel — clients can only receive text. To work around this, the plugin scans agent output for local image paths (`MEDIA:<path>`, `![alt](/abs/path.png)`, etc.), reads the file, base64-encodes it, and rewrites the reference to a `data:image/<type>;base64,…` URL before streaming. BoltAI's markdown renderer displays the image inline. Works for `image_generate`, vision/browser screenshots, and any other tool that returns a local file path. Both streaming and non-streaming responses are rewritten. Files larger than 8 MB are skipped (configurable in `image_inliner.py`) to avoid blowing up response sizes. Note that BoltAI strips data URLs from the conversation history it replays on subsequent turns, so this does not eat input tokens on follow-ups.
 
 ## Configuration reference
 
@@ -189,6 +191,7 @@ boltai-hermes-gateway/
 ├── plugin.yaml          # Plugin manifest with optional_env declarations
 ├── __init__.py          # Re-exports register from adapter
 ├── adapter.py           # BoltAIGatewayAdapter — subclasses APIServerAdapter
+├── image_inliner.py     # Local-image-path → data-URL rewriter (streaming + final)
 ├── README.md            # This file
 ├── LICENSE              # Apache-2.0 (matches Hermes upstream)
 ├── pyproject.toml       # Optional packaging metadata

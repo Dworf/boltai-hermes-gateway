@@ -39,6 +39,8 @@ from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.base import MessageEvent, MessageType
 from hermes_cli.commands import GATEWAY_KNOWN_COMMANDS, resolve_command
 
+from .image_inliner import StreamingImageRewriter, rewrite_local_images
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = 8643
@@ -664,6 +666,80 @@ class BoltAIGatewayAdapter(APIServerAdapter):
             except Exception:
                 logger.debug("write_eof failed during slash stream cleanup", exc_info=True)
         return resp
+
+
+    # ------------------------------------------------------------------
+    # Image inlining override
+    # ------------------------------------------------------------------
+
+    async def _run_agent(
+        self,
+        user_message: str,
+        conversation_history,
+        ephemeral_system_prompt=None,
+        session_id=None,
+        stream_delta_callback=None,
+        tool_progress_callback=None,
+        tool_start_callback=None,
+        tool_complete_callback=None,
+        agent_ref=None,
+        gateway_session_key=None,
+    ):
+        """Override: rewrite local image paths to base64 data URLs.
+
+        BoltAI / OpenAI-compatible clients can't read the gateway's
+        filesystem, so ``![cat](/Users/.../foo.png)`` won't render.  We
+        replace local-path markdown images with ``data:image/...;base64,``
+        URLs so the markdown renderer displays them inline.
+
+        * Streaming: wrap ``stream_delta_callback`` with a buffered
+          rewriter that holds back text only when an unclosed ``![`` is
+          in flight.  The original callback (which feeds the SSE queue)
+          sees rewritten text.
+        * Non-streaming: rewrite ``result['final_response']`` after the
+          agent returns, before passing it back up to the parent's
+          response-builder.
+        * The buffer is flushed on agent completion so the trailing
+          partial — if any — still reaches the client.
+        """
+        rewriter = None
+        cb = stream_delta_callback
+        if cb is not None:
+            rewriter = StreamingImageRewriter(emit=cb)
+            cb = rewriter.feed
+
+        try:
+            result, usage = await super()._run_agent(
+                user_message=user_message,
+                conversation_history=conversation_history,
+                ephemeral_system_prompt=ephemeral_system_prompt,
+                session_id=session_id,
+                stream_delta_callback=cb,
+                tool_progress_callback=tool_progress_callback,
+                tool_start_callback=tool_start_callback,
+                tool_complete_callback=tool_complete_callback,
+                agent_ref=agent_ref,
+                gateway_session_key=gateway_session_key,
+            )
+        finally:
+            if rewriter is not None:
+                try:
+                    rewriter.flush()
+                except Exception:
+                    logger.exception("Image rewriter flush failed")
+
+        # Non-streaming path uses result['final_response'] directly.  The
+        # streaming path also reads it as a fallback when no deltas were
+        # emitted (see api_server.py L1789-1797), so rewriting it here
+        # covers both.
+        if isinstance(result, dict):
+            fr = result.get("final_response")
+            if isinstance(fr, str) and fr:
+                try:
+                    result["final_response"] = rewrite_local_images(fr)
+                except Exception:
+                    logger.exception("final_response image rewrite failed")
+        return result, usage
 
 
 def _check_requirements() -> tuple[bool, str]:

@@ -1,7 +1,7 @@
 name: boltai-hermes-gateway-platform
 label: BoltAI Hermes Gateway
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: >
   OpenAI-compatible HTTP server with slash-command interception.
   Subclasses the built-in api_server adapter, runs on its own port (default 8643),
